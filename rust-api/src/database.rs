@@ -1468,64 +1468,90 @@ impl DatabasePool {
 
                 if let Some(row) = podcast_row {
                     let podcast_id: i32 = row.try_get("podcastid")?;
-                    
+
+                    // Run all cascading deletes in one transaction so a partial failure
+                    // can't leave orphaned rows or a wrong UserStats count.
+                    let mut tx = pool.begin().await?;
+
                     // Delete in the proper order to handle foreign key constraints
                     // 1. PlaylistContents first
-                    sqlx::query(r#"DELETE FROM "PlaylistContents" WHERE "EpisodeID" IN (SELECT "EpisodeID" FROM "Episodes" WHERE "PodcastID" = $1)"#)
+                    sqlx::query(r#"DELETE FROM "PlaylistContents" WHERE episodeid IN (SELECT episodeid FROM "Episodes" WHERE podcastid = $1)"#)
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
-                    
+
                     // 2. UserEpisodeHistory
-                    sqlx::query(r#"DELETE FROM "UserEpisodeHistory" WHERE "EpisodeID" IN (SELECT "EpisodeID" FROM "Episodes" WHERE "PodcastID" = $1)"#)
+                    sqlx::query(r#"DELETE FROM "UserEpisodeHistory" WHERE episodeid IN (SELECT episodeid FROM "Episodes" WHERE podcastid = $1)"#)
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
-                    
+
                     // 3. DownloadedEpisodes
-                    sqlx::query(r#"DELETE FROM "DownloadedEpisodes" WHERE "EpisodeID" IN (SELECT "EpisodeID" FROM "Episodes" WHERE "PodcastID" = $1)"#)
+                    sqlx::query(r#"DELETE FROM "DownloadedEpisodes" WHERE episodeid IN (SELECT episodeid FROM "Episodes" WHERE podcastid = $1)"#)
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
-                    
+
                     // 4. SavedEpisodes
-                    sqlx::query(r#"DELETE FROM "SavedEpisodes" WHERE "EpisodeID" IN (SELECT "EpisodeID" FROM "Episodes" WHERE "PodcastID" = $1)"#)
+                    sqlx::query(r#"DELETE FROM "SavedEpisodes" WHERE episodeid IN (SELECT episodeid FROM "Episodes" WHERE podcastid = $1)"#)
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
-                    
-                    // 5. QueuedEpisodes (EpisodeQueue in Python)
-                    sqlx::query(r#"DELETE FROM "QueuedEpisodes" WHERE "EpisodeID" IN (SELECT "EpisodeID" FROM "Episodes" WHERE "PodcastID" = $1)"#)
+
+                    // 5. EpisodeQueue
+                    sqlx::query(r#"DELETE FROM "EpisodeQueue" WHERE episodeid IN (SELECT episodeid FROM "Episodes" WHERE podcastid = $1)"#)
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
-                    
+
                     // 6. Episodes
-                    sqlx::query(r#"DELETE FROM "Episodes" WHERE "PodcastID" = $1"#)
+                    sqlx::query(r#"DELETE FROM "Episodes" WHERE podcastid = $1"#)
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // 6a. YouTubeVideos dependents (NO ACTION FKs) before the videos themselves
+                    sqlx::query(r#"DELETE FROM "UserVideoHistory" WHERE videoid IN (SELECT videoid FROM "YouTubeVideos" WHERE podcastid = $1)"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query(r#"DELETE FROM "SavedVideos" WHERE videoid IN (SELECT videoid FROM "YouTubeVideos" WHERE podcastid = $1)"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query(r#"DELETE FROM "DownloadedVideos" WHERE videoid IN (SELECT videoid FROM "YouTubeVideos" WHERE podcastid = $1)"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // 6a2. YouTubeVideos — references Podcasts (NO ACTION), so must go before the podcast
+                    sqlx::query(r#"DELETE FROM "YouTubeVideos" WHERE podcastid = $1"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
                         .await?;
 
                     // 6b. PeopleEpisodes — host-feed rows may reference this podcast (FK is
                     // NO ACTION); delete them so the Podcasts delete can't FK-error.
                     sqlx::query(r#"DELETE FROM "PeopleEpisodes" WHERE podcastid = $1"#)
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
 
                     // 7. Finally delete the podcast
-                    sqlx::query(r#"DELETE FROM "Podcasts" WHERE "PodcastID" = $1"#)
+                    sqlx::query(r#"DELETE FROM "Podcasts" WHERE podcastid = $1"#)
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
-                    
+
                     // 8. Update UserStats - decrement PodcastsAdded
                     sqlx::query(r#"UPDATE "UserStats" SET podcastsadded = podcastsadded - 1 WHERE userid = $1"#)
                         .bind(user_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
+
+                    tx.commit().await?;
                 }
-                
+
                 Ok(())
             }
             DatabasePool::MySQL(pool) => {
@@ -1541,56 +1567,82 @@ impl DatabasePool {
                 .await?;
 
                 if let Some(row) = podcast_row {
-                    let podcast_id: i32 = row.try_get("podcastid")?;
-                    
+                    let podcast_id: i32 = row.try_get("PodcastID")?;
+
+                    // Run all cascading deletes in one transaction so a partial failure
+                    // can't leave orphaned rows or a wrong UserStats count.
+                    let mut tx = pool.begin().await?;
+
                     // Delete in the proper order to handle foreign key constraints
                     sqlx::query("DELETE FROM PlaylistContents WHERE EpisodeID IN (SELECT EpisodeID FROM Episodes WHERE PodcastID = ?)")
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
-                    
+
                     sqlx::query("DELETE FROM UserEpisodeHistory WHERE EpisodeID IN (SELECT EpisodeID FROM Episodes WHERE PodcastID = ?)")
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
-                    
+
                     sqlx::query("DELETE FROM DownloadedEpisodes WHERE EpisodeID IN (SELECT EpisodeID FROM Episodes WHERE PodcastID = ?)")
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
-                    
+
                     sqlx::query("DELETE FROM SavedEpisodes WHERE EpisodeID IN (SELECT EpisodeID FROM Episodes WHERE PodcastID = ?)")
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
-                    
-                    sqlx::query("DELETE FROM QueuedEpisodes WHERE EpisodeID IN (SELECT EpisodeID FROM Episodes WHERE PodcastID = ?)")
+
+                    sqlx::query("DELETE FROM EpisodeQueue WHERE EpisodeID IN (SELECT EpisodeID FROM Episodes WHERE PodcastID = ?)")
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
-                    
+
                     sqlx::query("DELETE FROM Episodes WHERE PodcastID = ?")
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // YouTubeVideos dependents (NO ACTION FKs) before the videos themselves
+                    sqlx::query("DELETE FROM UserVideoHistory WHERE VideoID IN (SELECT VideoID FROM YouTubeVideos WHERE PodcastID = ?)")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM SavedVideos WHERE VideoID IN (SELECT VideoID FROM YouTubeVideos WHERE PodcastID = ?)")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM DownloadedVideos WHERE VideoID IN (SELECT VideoID FROM YouTubeVideos WHERE PodcastID = ?)")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // YouTubeVideos — references Podcasts (NO ACTION), so must go before the podcast
+                    sqlx::query("DELETE FROM YouTubeVideos WHERE PodcastID = ?")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
                         .await?;
 
                     // PeopleEpisodes — see Postgres branch rationale.
                     sqlx::query("DELETE FROM PeopleEpisodes WHERE PodcastID = ?")
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
 
                     sqlx::query("DELETE FROM Podcasts WHERE PodcastID = ?")
                         .bind(podcast_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
 
                     sqlx::query("UPDATE UserStats SET PodcastsAdded = PodcastsAdded - 1 WHERE UserID = ?")
                         .bind(user_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
+
+                    tx.commit().await?;
                 }
-                
+
                 Ok(())
             }
         }
@@ -26525,26 +26577,190 @@ impl DatabasePool {
     pub async fn remove_podcast_by_url(&self, user_id: i32, feed_url: &str) -> AppResult<()> {
         match self {
             DatabasePool::Postgres(pool) => {
-                let result = sqlx::query(r#"DELETE FROM "Podcasts" WHERE feedurl = $1 AND userid = $2"#)
-                    .bind(feed_url)
-                    .bind(user_id)
-                    .execute(pool)
-                    .await?;
-                    
-                if result.rows_affected() > 0 {
+                // Look up the podcast ID first so we can cascade the child deletes.
+                // A bare DELETE FROM "Podcasts" FK-errors for any podcast that still
+                // has Episodes/YouTubeVideos/PeopleEpisodes rows (NO ACTION FKs).
+                let podcast_row = sqlx::query(
+                    r#"SELECT podcastid FROM "Podcasts" WHERE feedurl = $1 AND userid = $2"#
+                )
+                .bind(feed_url)
+                .bind(user_id)
+                .fetch_optional(pool)
+                .await?;
+
+                if let Some(row) = podcast_row {
+                    let podcast_id: i32 = row.try_get("podcastid")?;
+
+                    // Run all cascading deletes in one transaction so a partial failure
+                    // can't leave orphaned rows or a wrong UserStats count.
+                    let mut tx = pool.begin().await?;
+
+                    // Delete in the proper order to handle foreign key constraints
+                    // 1. PlaylistContents first
+                    sqlx::query(r#"DELETE FROM "PlaylistContents" WHERE episodeid IN (SELECT episodeid FROM "Episodes" WHERE podcastid = $1)"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // 2. UserEpisodeHistory
+                    sqlx::query(r#"DELETE FROM "UserEpisodeHistory" WHERE episodeid IN (SELECT episodeid FROM "Episodes" WHERE podcastid = $1)"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // 3. DownloadedEpisodes
+                    sqlx::query(r#"DELETE FROM "DownloadedEpisodes" WHERE episodeid IN (SELECT episodeid FROM "Episodes" WHERE podcastid = $1)"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // 4. SavedEpisodes
+                    sqlx::query(r#"DELETE FROM "SavedEpisodes" WHERE episodeid IN (SELECT episodeid FROM "Episodes" WHERE podcastid = $1)"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // 5. EpisodeQueue
+                    sqlx::query(r#"DELETE FROM "EpisodeQueue" WHERE episodeid IN (SELECT episodeid FROM "Episodes" WHERE podcastid = $1)"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // 6. Episodes
+                    sqlx::query(r#"DELETE FROM "Episodes" WHERE podcastid = $1"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // 6a. YouTubeVideos dependents (NO ACTION FKs) before the videos themselves
+                    sqlx::query(r#"DELETE FROM "UserVideoHistory" WHERE videoid IN (SELECT videoid FROM "YouTubeVideos" WHERE podcastid = $1)"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query(r#"DELETE FROM "SavedVideos" WHERE videoid IN (SELECT videoid FROM "YouTubeVideos" WHERE podcastid = $1)"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query(r#"DELETE FROM "DownloadedVideos" WHERE videoid IN (SELECT videoid FROM "YouTubeVideos" WHERE podcastid = $1)"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // 6a2. YouTubeVideos — references Podcasts (NO ACTION), so must go before the podcast
+                    sqlx::query(r#"DELETE FROM "YouTubeVideos" WHERE podcastid = $1"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // 6b. PeopleEpisodes — host-feed rows may reference this podcast (NO ACTION FK)
+                    sqlx::query(r#"DELETE FROM "PeopleEpisodes" WHERE podcastid = $1"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // 7. Finally delete the podcast itself
+                    sqlx::query(r#"DELETE FROM "Podcasts" WHERE podcastid = $1"#)
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // 8. Update UserStats - decrement PodcastsAdded
+                    sqlx::query(r#"UPDATE "UserStats" SET podcastsadded = podcastsadded - 1 WHERE userid = $1"#)
+                        .bind(user_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    tx.commit().await?;
                     tracing::info!("Successfully removed podcast {} for user {}", feed_url, user_id);
                 } else {
                     tracing::info!("Podcast {} not found for user {}", feed_url, user_id);
                 }
             }
             DatabasePool::MySQL(pool) => {
-                let result = sqlx::query("DELETE FROM Podcasts WHERE FeedURL = ? AND UserID = ?")
-                    .bind(feed_url)
-                    .bind(user_id)
-                    .execute(pool)
-                    .await?;
-                    
-                if result.rows_affected() > 0 {
+                // Look up the podcast ID first so we can cascade the child deletes.
+                let podcast_row = sqlx::query(
+                    "SELECT PodcastID FROM Podcasts WHERE FeedURL = ? AND UserID = ?"
+                )
+                .bind(feed_url)
+                .bind(user_id)
+                .fetch_optional(pool)
+                .await?;
+
+                if let Some(row) = podcast_row {
+                    let podcast_id: i32 = row.try_get("PodcastID")?;
+
+                    // Run all cascading deletes in one transaction so a partial failure
+                    // can't leave orphaned rows or a wrong UserStats count.
+                    let mut tx = pool.begin().await?;
+
+                    // Delete in the proper order to handle foreign key constraints
+                    sqlx::query("DELETE FROM PlaylistContents WHERE EpisodeID IN (SELECT EpisodeID FROM Episodes WHERE PodcastID = ?)")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    sqlx::query("DELETE FROM UserEpisodeHistory WHERE EpisodeID IN (SELECT EpisodeID FROM Episodes WHERE PodcastID = ?)")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    sqlx::query("DELETE FROM DownloadedEpisodes WHERE EpisodeID IN (SELECT EpisodeID FROM Episodes WHERE PodcastID = ?)")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    sqlx::query("DELETE FROM SavedEpisodes WHERE EpisodeID IN (SELECT EpisodeID FROM Episodes WHERE PodcastID = ?)")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    sqlx::query("DELETE FROM EpisodeQueue WHERE EpisodeID IN (SELECT EpisodeID FROM Episodes WHERE PodcastID = ?)")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    sqlx::query("DELETE FROM Episodes WHERE PodcastID = ?")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // YouTubeVideos dependents (NO ACTION FKs) before the videos themselves
+                    sqlx::query("DELETE FROM UserVideoHistory WHERE VideoID IN (SELECT VideoID FROM YouTubeVideos WHERE PodcastID = ?)")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM SavedVideos WHERE VideoID IN (SELECT VideoID FROM YouTubeVideos WHERE PodcastID = ?)")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM DownloadedVideos WHERE VideoID IN (SELECT VideoID FROM YouTubeVideos WHERE PodcastID = ?)")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // YouTubeVideos — references Podcasts (NO ACTION), so must go before the podcast
+                    sqlx::query("DELETE FROM YouTubeVideos WHERE PodcastID = ?")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    // PeopleEpisodes — see Postgres branch rationale.
+                    sqlx::query("DELETE FROM PeopleEpisodes WHERE PodcastID = ?")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    sqlx::query("DELETE FROM Podcasts WHERE PodcastID = ?")
+                        .bind(podcast_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    sqlx::query("UPDATE UserStats SET PodcastsAdded = PodcastsAdded - 1 WHERE UserID = ?")
+                        .bind(user_id)
+                        .execute(&mut *tx)
+                        .await?;
+
+                    tx.commit().await?;
                     tracing::info!("Successfully removed podcast {} for user {}", feed_url, user_id);
                 } else {
                     tracing::info!("Podcast {} not found for user {}", feed_url, user_id);
